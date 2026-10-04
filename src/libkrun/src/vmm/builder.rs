@@ -1327,6 +1327,27 @@ pub fn build_microvm(
         any(target_os = "linux", target_os = "windows")
     )))]
     let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+
+    // Detect RISC-V ISA information from KVM before FDT generation
+    #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+    let riscv_isa_info = {
+        if let Some(isa_info) = &vm_resources.riscv_isa_info {
+            Some(isa_info.clone())
+        } else {
+            let vm_fd = vmm.vm.fd();
+            match arch::riscv64::linux::kvm::detect_host_isa(vm_fd) {
+                Ok(isa_info) => Some(isa_info),
+                Err(e) => {
+                    log::warn!("Failed to detect RISC-V ISA information: {:?}", e);
+                    None
+                }
+            }
+        }
+    };
+
+    #[cfg(not(all(target_os = "linux", target_arch = "riscv64")))]
+    let _riscv_isa_info: Option<()> = None;
+
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
@@ -1335,6 +1356,8 @@ pub fn build_microvm(
         vm_resources.acpi_enabled,
         &virtio_mmio_devices,
         payload_config.pvh,
+        #[cfg(target_arch = "riscv64")]
+        &riscv_isa_info,
     )
     .map_err(StartMicrovmError::Internal)?;
 
