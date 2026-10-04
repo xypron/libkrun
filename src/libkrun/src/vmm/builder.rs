@@ -1328,14 +1328,17 @@ pub fn build_microvm(
     )))]
     let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
 
-    // Detect RISC-V ISA information from KVM before FDT generation
+    // Detect RISC-V ISA information from KVM before FDT generation. This
+    // queries vCPU 0's registers directly, so it must run against the
+    // already-created vCPU 0 (`vcpus[0]`) rather than creating a new one,
+    // since KVM only allows one vCPU per id (KVM_CREATE_VCPU on an
+    // existing id fails with -EEXIST).
     #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
     let riscv_isa_info = {
         if let Some(isa_info) = &vm_resources.riscv_isa_info {
             Some(isa_info.clone())
         } else {
-            let vm_fd = vmm.vm.fd();
-            match arch::riscv64::linux::kvm::detect_host_isa(vm_fd) {
+            match vcpus[0].detect_riscv_isa() {
                 Ok(isa_info) => Some(isa_info),
                 Err(e) => {
                     log::warn!("Failed to detect RISC-V ISA information: {:?}", e);

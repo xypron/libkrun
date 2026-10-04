@@ -4,17 +4,138 @@
 use std::collections::BTreeSet;
 use std::result;
 
-use kvm_ioctls::VmFd;
+use kvm_bindings::RegList;
+use kvm_ioctls::VcpuFd;
 use log::debug;
 
 /// Errors encountered during ISA detection and configuration discovery.
 #[derive(Debug)]
 pub enum IsaError {
-    /// Failed to read ISA register from KVM.
+    /// Failed to read the `isa` CONFIG register from KVM.
     ReadIsaReg(kvm_ioctls::Error),
 }
 
 type Result<T> = result::Result<T, IsaError>;
+
+// RISC-V ISA extension KVM register IDs, verified against
+// linux-7.2.9 arch/riscv/include/uapi/asm/kvm.h and arch/riscv/kvm/isa.c.
+//
+// Unlike bit positions in the human-readable `riscv,isa` devicetree string,
+// KVM's ISA_EXT register IDs are a flat, *sequential* enum
+// (`enum KVM_RISCV_ISA_EXT_ID`), currently 0..77 (KVM_RISCV_ISA_EXT_MAX=78).
+// This is NOT the same numbering as the single-letter bit positions used by
+// the `isa` CONFIG register (which is a GENMASK(25,0) bitmask, see
+// `read_isa_bitmask()` below).
+//
+// kvm-bindings 0.14.1 only defines IDs 0..=70 (stale vs. linux-7.2.9's 0..=77),
+// so IDs 71-77 are listed here as explicit literals with a comment citing the
+// kernel header, rather than crate constants.
+const KVM_ISA_EXT_TABLE: &[(&str, u64)] = &[
+    ("a", 0),
+    ("c", 1),
+    ("d", 2),
+    ("f", 3),
+    ("h", 4),
+    ("i", 5),
+    ("m", 6),
+    ("svpbmt", 7),
+    ("sstc", 8),
+    ("svinval", 9),
+    ("zihintpause", 10),
+    ("zicbom", 11),
+    ("zicboz", 12),
+    ("zbb", 13),
+    ("ssaia", 14),
+    ("v", 15),
+    ("svnapot", 16),
+    ("zba", 17),
+    ("zbs", 18),
+    ("zicntr", 19),
+    ("zicsr", 20),
+    ("zifencei", 21),
+    ("zihpm", 22),
+    ("smstateen", 23),
+    ("zicond", 24),
+    ("zbc", 25),
+    ("zbkb", 26),
+    ("zbkc", 27),
+    ("zbkx", 28),
+    ("zknd", 29),
+    ("zkne", 30),
+    ("zknh", 31),
+    ("zkr", 32),
+    ("zksed", 33),
+    ("zksh", 34),
+    ("zkt", 35),
+    ("zvbb", 36),
+    ("zvbc", 37),
+    ("zvkb", 38),
+    ("zvkg", 39),
+    ("zvkned", 40),
+    ("zvknha", 41),
+    ("zvknhb", 42),
+    ("zvksed", 43),
+    ("zvksh", 44),
+    ("zvkt", 45),
+    ("zfh", 46),
+    ("zfhmin", 47),
+    ("zihintntl", 48),
+    ("zvfh", 49),
+    ("zvfhmin", 50),
+    ("zfa", 51),
+    ("ztso", 52),
+    ("zacas", 53),
+    ("sscofpmf", 54),
+    ("zimop", 55),
+    ("zca", 56),
+    ("zcb", 57),
+    ("zcd", 58),
+    ("zcf", 59),
+    ("zcmop", 60),
+    ("zawrs", 61),
+    ("smnpm", 62),
+    ("ssnpm", 63),
+    ("svade", 64),
+    ("svadu", 65),
+    ("svvptc", 66),
+    ("zabha", 67),
+    ("ziccrse", 68),
+    ("zaamo", 69),
+    ("zalrsc", 70),
+    // IDs 71-77: not yet in kvm-bindings 0.14.1, see
+    // arch/riscv/include/uapi/asm/kvm.h enum KVM_RISCV_ISA_EXT_ID.
+    ("zicbop", 71),
+    ("zfbfmin", 72),
+    ("zvfbfmin", 73),
+    ("zvfbfwma", 74),
+    ("zclsd", 75),
+    ("zilsd", 76),
+    ("zalasr", 77),
+];
+
+/// Subtype for single ISA extension registers (`KVM_REG_RISCV_ISA_SINGLE`),
+/// i.e. subtype 0 within the `KVM_REG_RISCV_ISA_EXT` register type.
+const KVM_REG_RISCV_ISA_SINGLE: u64 = 0;
+
+/// Builds the KVM register ID for a single ISA extension, given its
+/// sequential `KVM_RISCV_ISA_EXT_ID` (0..77), per
+/// `KVM_REG_RISCV | KVM_REG_SIZE_ULONG | KVM_REG_RISCV_ISA_EXT | KVM_REG_RISCV_ISA_SINGLE | id`.
+fn isa_ext_reg_id(kvm_ext_id: u64) -> u64 {
+    kvm_bindings::KVM_REG_RISCV as u64
+        | kvm_bindings::KVM_REG_SIZE_U64
+        | u64::from(kvm_bindings::KVM_REG_RISCV_ISA_EXT)
+        | KVM_REG_RISCV_ISA_SINGLE
+        | kvm_ext_id
+}
+
+/// Returns true if `err` corresponds to the kernel reporting that an
+/// extension/register is unknown or unsupported on the host
+/// (`-ENOENT`, from `__kvm_riscv_isa_check_host()` in
+/// arch/riscv/kvm/isa.c). This is the error KVM returns for unsupported
+/// ISA extensions; `EINVAL` is reserved for register-size mismatches.
+fn is_not_supported(err: &kvm_ioctls::Error) -> bool {
+    err.errno() == libc::ENOENT
+}
 
 /// ISA extension information discovered from the host KVM.
 #[derive(Debug, Clone)]
@@ -31,44 +152,49 @@ pub struct RiscvIsaInfo {
     pub zicbop_block_size: Option<u32>,
 }
 
-/// Helper macro to get the ID of a riscv64 CONFIG register.
-#[macro_export]
-macro_rules! riscv64_config_reg {
-    ($offset: tt) => {
-        kvm_bindings::KVM_REG_RISCV as u64
-            | u64::from(kvm_bindings::KVM_REG_SIZE_U64)
-            | u64::from(kvm_bindings::KVM_REG_RISCV_CONFIG)
-            | (($offset / std::mem::size_of::<u64>()) as u64)
-    };
+/// Builds the KVM register ID for a `struct kvm_riscv_config` field, given
+/// its *field index* (NOT byte offset) within that struct, i.e.
+/// `offsetof(struct kvm_riscv_config, field) / sizeof(unsigned long)` as
+/// defined by `KVM_REG_RISCV_CONFIG_REG()` in
+/// arch/riscv/include/uapi/asm/kvm.h.
+///
+/// Field order (linux-7.2.9): isa=0, zicbom_block_size=1, mvendorid=2,
+/// marchid=3, mimpid=4, zicboz_block_size=5, satp_mode=6, zicbop_block_size=7.
+/// Note kvm-bindings 0.14.1's `kvm_riscv_config` struct is stale and omits
+/// `zicbop_block_size`, so we address fields purely by their kernel-defined
+/// index rather than via `offset_of!` on the (incomplete) crate struct.
+fn config_reg_id(field_index: u64) -> u64 {
+    kvm_bindings::KVM_REG_RISCV as u64
+        | kvm_bindings::KVM_REG_SIZE_U64
+        | u64::from(kvm_bindings::KVM_REG_RISCV_CONFIG)
+        | field_index
 }
 
-/// Helper macro to get the ID of a riscv64 ISA_EXT register.
-#[macro_export]
-macro_rules! riscv64_isa_ext_reg {
-    ($subtype: tt, $ext_id: tt) => {
-        kvm_bindings::KVM_REG_RISCV as u64
-            | u64::from(kvm_bindings::KVM_REG_SIZE_U64)
-            | u64::from(kvm_bindings::KVM_REG_RISCV_ISA_EXT)
-            | (($subtype as u64) << 16)
-            | ($ext_id as u64)
-    };
-}
+const CONFIG_REG_ISA: u64 = 0;
+const CONFIG_REG_ZICBOM_BLOCK_SIZE: u64 = 1;
+const CONFIG_REG_ZICBOZ_BLOCK_SIZE: u64 = 5;
+const CONFIG_REG_ZICBOP_BLOCK_SIZE: u64 = 7;
+
+/// Mask for the base single-letter ISA extensions within the `isa` CONFIG
+/// register, i.e. `KVM_RISCV_BASE_ISA_MASK = GENMASK(25, 0)` from
+/// arch/riscv/kvm/vcpu_onereg.c.
+const KVM_RISCV_BASE_ISA_MASK: u64 = (1u64 << 26) - 1;
 
 /// Detects the host ISA configuration and supported extensions.
-pub fn detect_host_isa(vm: &VmFd) -> Result<RiscvIsaInfo> {
+pub fn detect_host_isa(vcpu: &VcpuFd) -> Result<RiscvIsaInfo> {
     debug!("Starting RISC-V ISA detection");
 
-    let isa_string = read_isa_register(vm)?;
-    debug!("Detected ISA string: {}", isa_string);
+    let isa_bitmask = read_isa_bitmask(vcpu)?;
+    debug!("Read ISA bitmask from vCPU 0: {:#x}", isa_bitmask);
 
-    let extensions = match detect_extensions_modern(vm) {
+    let extensions = match detect_extensions_modern(vcpu) {
         Some(exts) => {
             debug!("Using modern detection method: {} extensions", exts.len());
             exts
         }
         None => {
             debug!("Modern detection returned None, falling back to legacy method");
-            detect_extensions_legacy(vm)
+            detect_extensions_legacy(vcpu)
         }
     };
 
@@ -78,9 +204,15 @@ pub fn detect_host_isa(vm: &VmFd) -> Result<RiscvIsaInfo> {
         extensions.iter().cloned().collect::<Vec<_>>().join(", ")
     );
 
-    let zicbom_block_size = read_block_size_if_present(vm, "zicbom_block_size");
-    let zicboz_block_size = read_block_size_if_present(vm, "zicboz_block_size");
-    let zicbop_block_size = read_block_size_if_present(vm, "zicbop_block_size");
+    let zicbom_block_size = read_block_size_if_present(vcpu, CONFIG_REG_ZICBOM_BLOCK_SIZE);
+    let zicboz_block_size = read_block_size_if_present(vcpu, CONFIG_REG_ZICBOZ_BLOCK_SIZE);
+    let zicbop_block_size = read_block_size_if_present(vcpu, CONFIG_REG_ZICBOP_BLOCK_SIZE);
+
+    // The kernel has no register that returns a human-readable ISA string;
+    // we build it ourselves from the base-ISA bitmask plus the detected
+    // multi-letter extensions, mirroring QEMU's riscv_isa_string()
+    // (target/riscv/cpu.c).
+    let isa_string = build_isa_string(isa_bitmask, &extensions);
 
     debug!(
         "ISA detection complete: isa_string={}, extensions={}, zicbom_block_size={:?}, zicboz_block_size={:?}, zicbop_block_size={:?}",
@@ -100,91 +232,170 @@ pub fn detect_host_isa(vm: &VmFd) -> Result<RiscvIsaInfo> {
     })
 }
 
-fn read_isa_register(vm: &VmFd) -> Result<String> {
-    debug!("Reading ISA register from vCPU 0");
+/// Reads the `isa` CONFIG register from vCPU 0.
+///
+/// Per `struct kvm_riscv_config` and `kvm_riscv_vcpu_get_reg_config()`
+/// (arch/riscv/kvm/vcpu_onereg.c), this is a `KVM_REG_SIZE_ULONG` register
+/// containing a `GENMASK(25, 0)` *bitmask* of the base single-letter
+/// extensions (bit N set => letter 'a'+N present) -- it is NOT a
+/// human-readable string.
+fn read_isa_bitmask(vcpu: &VcpuFd) -> Result<u64> {
+    debug!("Reading isa CONFIG register (bitmask) from vCPU 0");
 
-    // Open existing vCPU 0 (it's guaranteed to exist by the time this is called)
-    let vcpu_fd = vm.create_vcpu(0).map_err(|e| IsaError::ReadIsaReg(e))?;
+    let reg_id = config_reg_id(CONFIG_REG_ISA);
+    let mut buffer = [0u8; 8];
+    vcpu.get_one_reg(reg_id, &mut buffer)
+        .map_err(IsaError::ReadIsaReg)?;
 
-    // KVM_REG_RISCV_CONFIG | KVM_REG_SIZE_U128 | offset for "isa"
-    // ISA string register: 16-byte register containing the ISA string
-    let isa_reg_id = kvm_bindings::KVM_REG_RISCV as u64
-        | u64::from(kvm_bindings::KVM_REG_SIZE_U128)
-        | u64::from(kvm_bindings::KVM_REG_RISCV_CONFIG)
-        | 0; // isa register offset
-
-    let mut isa_bytes = [0u8; 16];
-    vcpu_fd
-        .get_one_reg(isa_reg_id, &mut isa_bytes)
-        .map_err(|e| IsaError::ReadIsaReg(e))?;
-
-    // Find NUL terminator and convert to string
-    let len = isa_bytes.iter().position(|&b| b == 0).unwrap_or(16);
-    let isa_string = String::from_utf8_lossy(&isa_bytes[..len]).to_string();
-    debug!("Read ISA string from vCPU 0: {}", isa_string);
-    Ok(isa_string)
+    Ok(u64::from_le_bytes(buffer) & KVM_RISCV_BASE_ISA_MASK)
 }
 
-fn detect_extensions_modern(_vm: &VmFd) -> Option<BTreeSet<String>> {
-    debug!("Modern detection: KVM_REG_RISCV_ISA_EXT not yet available, using legacy method");
-    None
-}
+/// Builds a human-readable `riscv,isa` string (e.g. `rv64imafdc_smaia_ssaia`)
+/// from the base-ISA bitmask and the set of detected multi-letter
+/// extensions, mirroring QEMU's `riscv_isa_string()` in target/riscv/cpu.c.
+fn build_isa_string(isa_bitmask: u64, extensions: &BTreeSet<String>) -> String {
+    let mut isa_string = String::from("rv64");
 
-fn extract_single_letter_extensions(isa_bits: u64) -> BTreeSet<String> {
-    let mut extensions = BTreeSet::new();
-
-    // Map bit positions to single-letter extensions (RISC-V convention)
-    let letter_map = [
-        ('a', 0),  // Atomic
-        ('b', 1),  // Bitmanip (preliminary)
-        ('c', 2),  // Compressed
-        ('d', 3),  // Double-precision Float
-        ('e', 4),  // Embedded (RV32E)
-        ('f', 5),  // Single-precision Float
-        ('g', 6),  // General (shorthand for IMAFD)
-        ('h', 7),  // Hypervisor
-        ('i', 8),  // Integer (Base)
-        ('j', 9),  // Dynamically Translated Languages
-        ('k', 10), // Reserved
-        ('l', 11), // Reserved
-        ('m', 12), // Multiply/Divide
-        ('n', 13), // User-level Interrupts
-        ('o', 14), // Reserved
-        ('p', 15), // Packed-SIMD (preliminary)
-        ('q', 16), // Quad-precision Float
-        ('r', 17), // Reserved
-        ('s', 18), // Supervisor mode
-        ('t', 19), // Transactional Memory (preliminary)
-        ('u', 20), // User mode
-        ('v', 21), // Vector
-        ('w', 22), // Reserved
-        ('x', 23), // Non-standard Extensions
-        ('y', 24), // Reserved
-        ('z', 25), // Reserve for extensions
-    ];
-
-    for (letter, bit) in &letter_map {
-        if isa_bits & (1u64 << bit) != 0 {
-            extensions.insert(letter.to_string());
+    for bit in 0..26u32 {
+        if isa_bitmask & (1u64 << bit) != 0 {
+            isa_string.push((b'a' + bit as u8) as char);
         }
     }
 
-    extensions
+    for ext in extensions {
+        if ext.len() > 1 {
+            isa_string.push('_');
+            isa_string.push_str(ext);
+        }
+    }
+
+    isa_string
 }
 
-fn detect_extensions_legacy(_vm: &VmFd) -> BTreeSet<String> {
-    // Legacy fallback: use hardcoded ISA bits and multi-letter extensions for RVA23S64
-    // Bit pattern: i(8) m(12) a(0) f(5) d(3) c(2) = bits set at positions 0,2,3,5,8,12
-    let isa_bits_rv64g: u64 = (1u64 << 0) // a - Atomic
-        | (1u64 << 2) // c - Compressed
-        | (1u64 << 3) // d - Double-precision Float
-        | (1u64 << 5) // f - Single-precision Float
-        | (1u64 << 8) // i - Integer (Base)
-        | (1u64 << 12); // m - Multiply/Divide
+fn detect_extensions_modern(vcpu: &VcpuFd) -> Option<BTreeSet<String>> {
+    debug!("Modern detection: Attempting KVM_GET_REG_LIST");
 
-    let mut extensions = extract_single_letter_extensions(isa_bits_rv64g);
+    let mut reg_list = match RegList::new(KVM_ISA_EXT_TABLE.len() + 64) {
+        Ok(list) => list,
+        Err(e) => {
+            debug!(
+                "Modern detection: Failed to create RegList: {:?}, falling back to legacy",
+                e
+            );
+            return None;
+        }
+    };
 
-    // Add multi-letter extensions for RVA23S64
+    match vcpu.get_reg_list(&mut reg_list) {
+        Ok(()) => {
+            debug!(
+                "Modern detection: Got register list with {} registers",
+                reg_list.as_slice().len()
+            );
+        }
+        Err(e) => {
+            if is_not_supported(&e) {
+                debug!("Modern detection: KVM_GET_REG_LIST not supported, falling back to legacy");
+            } else {
+                debug!(
+                    "Modern detection: Error getting register list: {:?}, falling back to legacy",
+                    e
+                );
+            }
+            return None;
+        }
+    }
+
+    let registers = reg_list.as_slice();
+    let mut extensions = BTreeSet::new();
+
+    for (name, kvm_ext_id) in KVM_ISA_EXT_TABLE {
+        let reg_id = isa_ext_reg_id(*kvm_ext_id);
+
+        if registers.contains(&reg_id) {
+            let mut buffer = [0u8; 8];
+            match vcpu.get_one_reg(reg_id, &mut buffer) {
+                Ok(_) => {
+                    if u64::from_le_bytes(buffer) != 0 {
+                        extensions.insert(name.to_string());
+                        debug!("Modern detection: Found extension {}", name);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Modern detection: Extension {} in list but failed to read: {:?}",
+                        name, e
+                    );
+                }
+            }
+        }
+    }
+
+    debug!(
+        "Modern detection: Successfully queried {} extensions",
+        extensions.len()
+    );
+
+    if extensions.is_empty() {
+        debug!("Modern detection: No extensions found via modern method, falling back to legacy");
+        None
+    } else {
+        Some(extensions)
+    }
+}
+
+fn detect_extensions_legacy(vcpu: &VcpuFd) -> BTreeSet<String> {
+    debug!("Legacy detection: Starting per-extension query of vCPU 0");
+
+    let mut extensions = BTreeSet::new();
+
+    for (name, kvm_ext_id) in KVM_ISA_EXT_TABLE {
+        let reg_id = isa_ext_reg_id(*kvm_ext_id);
+
+        let mut buffer = [0u8; 8];
+        match vcpu.get_one_reg(reg_id, &mut buffer) {
+            Ok(_) => {
+                if u64::from_le_bytes(buffer) != 0 {
+                    extensions.insert(name.to_string());
+                    debug!("Legacy detection: Extension {} supported", name);
+                }
+            }
+            Err(e) => {
+                if !is_not_supported(&e) {
+                    debug!(
+                        "Legacy detection: Error querying extension {}: {:?}",
+                        name, e
+                    );
+                }
+                // Silently skip ENOENT errors (expected for unsupported extensions)
+            }
+        }
+    }
+
+    debug!(
+        "Legacy detection: Successfully queried extensions, found {} supported",
+        extensions.len()
+    );
+
+    if extensions.is_empty() {
+        debug!("Legacy detection: No extensions detected, using hardcoded fallback");
+        detect_extensions_fallback()
+    } else {
+        extensions
+    }
+}
+
+/// Hardcoded fallback for RVA23S64 when extension queries fail
+fn detect_extensions_fallback() -> BTreeSet<String> {
+    let mut extensions = BTreeSet::new();
+
+    // RVA23S64 base ISA: rv64imafdc
+    let base_extensions = ["a", "c", "d", "f", "i", "m"];
+    for ext in &base_extensions {
+        extensions.insert(ext.to_string());
+    }
+
+    // Add standard multi-letter extensions for RVA23S64
     let multi_letter = [
         "zicsr", "zifencei", // Counter/Supervisor CSRs
         "zicbom", "zicbop", "zicboz", // Cache block operations
@@ -198,20 +409,51 @@ fn detect_extensions_legacy(_vm: &VmFd) -> BTreeSet<String> {
     }
 
     debug!(
-        "Legacy detection: Using fallback extensions ({}): {:?}",
-        extensions.len(),
-        extensions
+        "Using hardcoded fallback for RVA23S64: {} extensions",
+        extensions.len()
     );
 
     extensions
 }
 
-fn read_block_size_if_present(_vm: &VmFd, config_field: &str) -> Option<u32> {
-    // Default cache block sizes for RISC-V64
-    // These match QEMU's defaults and common hardware configurations
-    match config_field {
-        "zicbom_block_size" | "zicboz_block_size" | "zicbop_block_size" => Some(64),
-        _ => None,
+/// Reads a cache block size CONFIG register (zicbom/zicboz/zicbop) from
+/// vCPU 0. `field_index` must be one of `CONFIG_REG_ZICBOM_BLOCK_SIZE`,
+/// `CONFIG_REG_ZICBOZ_BLOCK_SIZE`, or `CONFIG_REG_ZICBOP_BLOCK_SIZE`.
+///
+/// Per `kvm_riscv_vcpu_get_reg_config()`, these registers are
+/// `KVM_REG_SIZE_ULONG` (i.e. 8 bytes on riscv64), NOT 4 bytes; the kernel
+/// returns 0 if the corresponding extension is unavailable on the host.
+fn read_block_size_if_present(vcpu: &VcpuFd, field_index: u64) -> Option<u32> {
+    const DEFAULT_BLOCK_SIZE: u32 = 64;
+
+    let reg_id = config_reg_id(field_index);
+    let mut buffer = [0u8; 8];
+    match vcpu.get_one_reg(reg_id, &mut buffer) {
+        Ok(_) => {
+            let block_size = u64::from_le_bytes(buffer);
+            if block_size == 0 {
+                debug!(
+                    "read_block_size_if_present: field {} reports 0 (extension unavailable)",
+                    field_index
+                );
+                None
+            } else {
+                debug!(
+                    "read_block_size_if_present: field {} = {} bytes (from vCPU 0)",
+                    field_index, block_size
+                );
+                Some(block_size as u32)
+            }
+        }
+        Err(e) => {
+            if !is_not_supported(&e) {
+                debug!(
+                    "read_block_size_if_present: Failed to read field {}: {:?}, using default {} bytes",
+                    field_index, e, DEFAULT_BLOCK_SIZE
+                );
+            }
+            Some(DEFAULT_BLOCK_SIZE)
+        }
     }
 }
 
@@ -219,8 +461,70 @@ fn read_block_size_if_present(_vm: &VmFd, config_field: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn hash_extension_name(name: &str) -> u32 {
-        name.len() as u32 % 256
+    #[test]
+    fn test_isa_ext_reg_id_matches_kernel_encoding() {
+        // KVM_REG_RISCV (bit 63) | KVM_REG_SIZE_U64 | KVM_REG_RISCV_ISA_EXT | id
+        // Verified against arch/riscv/include/uapi/asm/kvm.h constants.
+        let reg_id = isa_ext_reg_id(0); // "a"
+        assert_eq!(reg_id & 0xFF, 0); // id = 0
+        assert_eq!(
+            reg_id & u64::from(kvm_bindings::KVM_REG_RISCV_ISA_EXT),
+            u64::from(kvm_bindings::KVM_REG_RISCV_ISA_EXT)
+        );
+
+        let reg_id_zicsr = isa_ext_reg_id(20); // "zicsr"
+        assert_eq!(reg_id_zicsr & 0xFF, 20);
+    }
+
+    #[test]
+    fn test_config_reg_id_isa_offset_zero() {
+        let reg_id = config_reg_id(CONFIG_REG_ISA);
+        assert_eq!(reg_id & 0xFF, 0);
+        assert_eq!(
+            reg_id & u64::from(kvm_bindings::KVM_REG_RISCV_CONFIG),
+            u64::from(kvm_bindings::KVM_REG_RISCV_CONFIG)
+        );
+    }
+
+    #[test]
+    fn test_kvm_isa_ext_table_has_no_duplicate_ids_or_names() {
+        let mut ids = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for (name, id) in KVM_ISA_EXT_TABLE {
+            assert!(ids.insert(*id), "duplicate KVM ext id: {id}");
+            assert!(names.insert(*name), "duplicate KVM ext name: {name}");
+        }
+        // KVM_RISCV_ISA_EXT_MAX in linux-7.2.9 is 78 (ids 0..=77).
+        assert_eq!(KVM_ISA_EXT_TABLE.len(), 78);
+    }
+
+    #[test]
+    fn test_build_isa_string_base_only() {
+        // Base ISA bits: a=0, c=2, d=3, f=5, i=8, m=12.
+        let bitmask =
+            (1u64 << 0) | (1u64 << 2) | (1u64 << 3) | (1u64 << 5) | (1u64 << 8) | (1u64 << 12);
+        let extensions = BTreeSet::new();
+        let isa_string = build_isa_string(bitmask, &extensions);
+        assert_eq!(isa_string, "rv64acdfim");
+    }
+
+    #[test]
+    fn test_build_isa_string_with_multi_letter_extensions() {
+        let bitmask = (1u64 << 8) | (1u64 << 12); // i, m
+        let mut extensions = BTreeSet::new();
+        extensions.insert("i".to_string());
+        extensions.insert("m".to_string());
+        extensions.insert("smaia".to_string());
+        extensions.insert("ssaia".to_string());
+
+        let isa_string = build_isa_string(bitmask, &extensions);
+        assert_eq!(isa_string, "rv64im_smaia_ssaia");
+    }
+
+    #[test]
+    fn test_is_not_supported_matches_enoent_only() {
+        assert!(is_not_supported(&kvm_ioctls::Error::new(libc::ENOENT)));
+        assert!(!is_not_supported(&kvm_ioctls::Error::new(libc::EINVAL)));
     }
 
     #[test]
@@ -311,18 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_extension_name() {
-        let hash_a = hash_extension_name("a");
-        let hash_i = hash_extension_name("i");
-        let hash_zicbom = hash_extension_name("zicbom");
-
-        // Just verify they're computed (values don't matter much for a hash)
-        assert!(hash_a < 256);
-        assert!(hash_i < 256);
-        assert!(hash_zicbom < 256);
-    }
-
-    #[test]
     fn test_extension_sorting() {
         let mut extensions = BTreeSet::new();
         extensions.insert("zvfh".to_string());
@@ -330,112 +622,45 @@ mod tests {
         extensions.insert("i".to_string());
         extensions.insert("smaia".to_string());
 
-        let mut ext_vec: Vec<_> = extensions.iter().cloned().collect();
+        let ext_vec: Vec<_> = extensions.iter().cloned().collect();
         assert_eq!(ext_vec[0], "i");
         assert_eq!(ext_vec[ext_vec.len() - 1], "zvfh");
     }
 
+    // The following tests exercise the real KVM ioctls and therefore need
+    // an actual KVM-backed vCPU, like the tests in `regs.rs`. They only run
+    // when executed on riscv64 hardware with /dev/kvm access (e.g. via
+    // cross-compiled `cargo test` on the target), mirroring the precedent
+    // set by `regs.rs::tests::test_read_timer_frequency`.
+
     #[test]
-    fn test_read_block_size_cbom() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-
-        let dummy_file = File::open("/dev/null").expect("Failed to open /dev/null");
-        let raw_fd = dummy_file.as_raw_fd();
-
-        unsafe {
-            let vm_fd = kvm_ioctls::VmFd::new(raw_fd);
-            let size = read_block_size_if_present(&vm_fd, "zicbom_block_size");
-            assert_eq!(size, Some(64));
-        }
+    fn test_read_block_size_if_present_cbom() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        // Either a real size (if host supports Zicbom) or the 64-byte
+        // fallback (if the register read fails) -- never None.
+        assert!(read_block_size_if_present(&vcpu, CONFIG_REG_ZICBOM_BLOCK_SIZE).is_some());
     }
 
     #[test]
-    fn test_read_block_size_cboz() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-
-        let dummy_file = File::open("/dev/null").expect("Failed to open /dev/null");
-        let raw_fd = dummy_file.as_raw_fd();
-
-        unsafe {
-            let vm_fd = kvm_ioctls::VmFd::new(raw_fd);
-            let size = read_block_size_if_present(&vm_fd, "zicboz_block_size");
-            assert_eq!(size, Some(64));
-        }
+    fn test_detect_extensions_legacy_includes_base_integer_extension() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let extensions = detect_extensions_legacy(&vcpu);
+        // "i" (base integer ISA) must always be present on any RISC-V host.
+        assert!(extensions.contains("i"));
     }
 
     #[test]
-    fn test_read_block_size_cbop() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-
-        let dummy_file = File::open("/dev/null").expect("Failed to open /dev/null");
-        let raw_fd = dummy_file.as_raw_fd();
-
-        unsafe {
-            let vm_fd = kvm_ioctls::VmFd::new(raw_fd);
-            let size = read_block_size_if_present(&vm_fd, "zicbop_block_size");
-            assert_eq!(size, Some(64));
-        }
-    }
-
-    #[test]
-    fn test_read_block_size_unknown_field() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-
-        let dummy_file = File::open("/dev/null").expect("Failed to open /dev/null");
-        let raw_fd = dummy_file.as_raw_fd();
-
-        unsafe {
-            let vm_fd = kvm_ioctls::VmFd::new(raw_fd);
-            let size = read_block_size_if_present(&vm_fd, "unknown_field");
-            assert_eq!(size, None);
-        }
-    }
-
-    #[test]
-    fn test_detect_extensions_legacy_includes_base_extensions() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-
-        let dummy_file = File::open("/dev/null").expect("Failed to open /dev/null");
-        let raw_fd = dummy_file.as_raw_fd();
-
-        unsafe {
-            let vm_fd = kvm_ioctls::VmFd::new(raw_fd);
-            let extensions = detect_extensions_legacy(&vm_fd);
-
-            // Verify base ISA extensions are present
-            assert!(extensions.contains("i"));
-            assert!(extensions.contains("m"));
-            assert!(extensions.contains("a"));
-            assert!(extensions.contains("f"));
-            assert!(extensions.contains("d"));
-            assert!(extensions.contains("c"));
-        }
-    }
-
-    #[test]
-    fn test_detect_extensions_legacy_includes_supervisor_extensions() {
-        use std::fs::File;
-        use std::os::fd::AsRawFd;
-
-        let dummy_file = File::open("/dev/null").expect("Failed to open /dev/null");
-        let raw_fd = dummy_file.as_raw_fd();
-
-        unsafe {
-            let vm_fd = kvm_ioctls::VmFd::new(raw_fd);
-            let extensions = detect_extensions_legacy(&vm_fd);
-
-            // Verify supervisor mode extensions are included
-            assert!(extensions.contains("smaia"));
-            assert!(extensions.contains("ssaia"));
-            assert!(extensions.contains("svpbmt"));
-            assert!(extensions.contains("sstc"));
-            assert!(extensions.contains("sscofpmf"));
-        }
+    fn test_detect_host_isa_returns_nonempty_isa_string() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let info = detect_host_isa(&vcpu).unwrap();
+        assert!(info.isa_string.starts_with("rv64"));
+        assert!(info.extensions.contains("i"));
     }
 
     #[test]
