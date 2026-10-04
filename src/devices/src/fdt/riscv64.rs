@@ -66,6 +66,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     aia_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
 ) -> Result<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -81,7 +82,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
-    create_cpu_nodes(&mut fdt, num_vcpu, timebase_frequency)?;
+    create_cpu_nodes(&mut fdt, num_vcpu, timebase_frequency, riscv_isa_info)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
@@ -102,7 +103,12 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32, timebase_frequency: u32) -> Result<()> {
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    num_cpus: u32,
+    timebase_frequency: u32,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
+) -> Result<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
     let cpus = fdt.begin_node("cpus")?;
     // As per documentation, on RISC-V 64-bit systems value should be set to 1.
@@ -115,7 +121,36 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32, timebase_frequency: u32)
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
         fdt.property_string("mmu-type", "sv48")?;
-        fdt.property_string("riscv,isa", "rv64imafdc_smaia_ssaia")?;
+
+        // Use detected ISA string if available, otherwise use default
+        let isa_str = riscv_isa_info
+            .as_ref()
+            .map(|info| info.isa_string.as_str())
+            .unwrap_or("rv64imafdc_smaia_ssaia");
+        fdt.property_string("riscv,isa", isa_str)?;
+
+        // Add ISA extensions if available
+        if let Some(isa_info) = riscv_isa_info {
+            if !isa_info.extensions.is_empty() {
+                let ext_array: Vec<&str> = isa_info.extensions.iter().map(|s| s.as_str()).collect();
+                // For now, serialize as a single string with commas
+                // TODO: Use property_string_array when available in vm-fdt
+                let ext_str = ext_array.join(",");
+                fdt.property_string("riscv,isa-extensions", &ext_str)?;
+            }
+
+            // Add cache block sizes if available
+            if let Some(size) = isa_info.zicbom_block_size {
+                fdt.property_u32("riscv,cbom-block-size", size)?;
+            }
+            if let Some(size) = isa_info.zicboz_block_size {
+                fdt.property_u32("riscv,cboz-block-size", size)?;
+            }
+            if let Some(size) = isa_info.zicbop_block_size {
+                fdt.property_u32("riscv,cbop-block-size", size)?;
+            }
+        }
+
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;
