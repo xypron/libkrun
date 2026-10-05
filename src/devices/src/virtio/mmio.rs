@@ -160,6 +160,24 @@ impl InterruptTransport {
             warn!(target: &self.0.log_target, "Failed to signal config change: {e:?}");
         }
     }
+
+    /// Must be called whenever the guest writes to VIRTIO_MMIO_INTERRUPT_ACK,
+    /// after clearing the acked bits from `status()`. If the status register
+    /// is now fully clear, explicitly de-asserts the IRQ line.
+    ///
+    /// This is a no-op for irqchip backends that deliver interrupts as
+    /// one-shot pulses through `register_irqfd()` (the default
+    /// `IrqChipT::clear_irq()` implementation), since those backends do not
+    /// track a persistent line level. It matters for backends that use a
+    /// direct, level-based injection (currently only riscv64's `KvmAia`),
+    /// mirroring how QEMU's `virtio_mmio_update_irq()` recomputes and
+    /// re-asserts the IRQ line's level on every ack.
+    fn on_ack(&self) -> Result<(), crate::Error> {
+        if self.status().load(Ordering::SeqCst) == 0 {
+            self.intc().lock().unwrap().clear_irq(self.0.irq_line)?;
+        }
+        Ok(())
+    }
 }
 
 impl MmioTransport {
@@ -483,6 +501,9 @@ impl BusDevice for MmioTransport {
                             self.interrupt
                                 .status()
                                 .fetch_and(!(v as usize), Ordering::SeqCst);
+                            if let Err(e) = self.interrupt.on_ack() {
+                                warn!("Failed to clear irq line on ack: {e:?}");
+                            }
                         }
                     }
                     0x70 => self.set_device_status(v),
