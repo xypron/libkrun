@@ -2166,6 +2166,12 @@ fn attach_legacy_devices(
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
+    #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+    mmio_device_manager
+        .register_mmio_rtc(intc)
+        .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+
     Ok(())
 }
 
