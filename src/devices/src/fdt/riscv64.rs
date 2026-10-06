@@ -122,25 +122,31 @@ fn create_cpu_nodes(
         fdt.property_string("compatible", "riscv")?;
         fdt.property_string("mmu-type", "sv48")?;
 
-        // Use detected ISA string if available, otherwise use default
-        let isa_str = riscv_isa_info
-            .as_ref()
-            .map(|info| info.isa_string.as_str())
-            .unwrap_or("rv64imafdc_smaia_ssaia");
-        fdt.property_string("riscv,isa", isa_str)?;
+        // "riscv,isa" is deprecated by the kernel in favor of the
+        // "riscv,isa-base" + "riscv,isa-extensions" pair; we only emit the
+        // modern properties.
+        //
+        // "riscv,isa-base" identifies the base ISA and is always "rv64i" on
+        // riscv64 (see Documentation/devicetree/bindings/riscv/extensions.yaml).
+        fdt.property_string("riscv,isa-base", "rv64i")?;
 
-        // Add ISA extensions if available
-        if let Some(isa_info) = riscv_isa_info {
-            if !isa_info.extensions.is_empty() {
-                // "riscv,isa-extensions" is a devicetree stringlist: each
-                // extension name must be its own NUL-terminated string, not
-                // a single comma-joined string. property_string_list()
-                // concatenates each entry with its own trailing NUL.
-                let ext_list: Vec<String> = isa_info.extensions.iter().cloned().collect();
-                fdt.property_string_list("riscv,isa-extensions", ext_list)?;
+        // "riscv,isa-extensions" is a devicetree stringlist: each extension
+        // name must be its own NUL-terminated string. property_string_list()
+        // concatenates each entry with its own trailing NUL. Use the
+        // detected extensions if available, otherwise fall back to a
+        // reasonable default set so the CPU node remains valid (the kernel
+        // requires at least "i", "m", "a" to be present).
+        let default_extensions: &[&str] = &["i", "m", "a", "f", "d", "c", "smaia", "ssaia"];
+        let ext_list: Vec<String> = match riscv_isa_info {
+            Some(isa_info) if !isa_info.extensions.is_empty() => {
+                isa_info.extensions.iter().cloned().collect()
             }
+            _ => default_extensions.iter().map(|s| s.to_string()).collect(),
+        };
+        fdt.property_string_list("riscv,isa-extensions", ext_list)?;
 
-            // Add cache block sizes if available
+        // Add cache block sizes if available
+        if let Some(isa_info) = riscv_isa_info {
             if let Some(size) = isa_info.zicbom_block_size {
                 fdt.property_u32("riscv,cbom-block-size", size)?;
             }
