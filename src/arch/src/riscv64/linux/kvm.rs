@@ -272,15 +272,50 @@ fn build_isa_string(isa_bitmask: u64, extensions: &BTreeSet<String>) -> String {
     isa_string
 }
 
-fn detect_extensions_modern(vcpu: &VcpuFd) -> Option<BTreeSet<String>> {
-    debug!("Modern detection: Attempting KVM_GET_REG_LIST");
-
-    let mut reg_list = match RegList::new(KVM_ISA_EXT_TABLE.len() + 64) {
+/// Queries `KVM_GET_REG_LIST` for the full set of register IDs the vCPU
+/// exposes, following the two-call size-discovery protocol used by QEMU's
+/// `kvm_riscv_init_cfg()` (target/riscv/kvm/kvm-cpu.c): an initial call with
+/// a zero-sized list is expected to fail with `-E2BIG` while reporting the
+/// real register count, which is then used to allocate a correctly-sized
+/// list and retry. Returns `None` if the ioctl is unsupported (`-ENOENT`)
+/// or any other unexpected error occurs.
+fn probe_reg_list(vcpu: &VcpuFd) -> Option<RegList> {
+    let mut probe = match RegList::new(0) {
         Ok(list) => list,
         Err(e) => {
             debug!(
-                "Modern detection: Failed to create RegList: {:?}, falling back to legacy",
+                "Modern detection: Failed to create probe RegList: {:?}, falling back to legacy",
                 e
+            );
+            return None;
+        }
+    };
+
+    let needed = match vcpu.get_reg_list(&mut probe) {
+        Ok(()) => {
+            // The vCPU genuinely has zero registers; nothing more to do.
+            return Some(probe);
+        }
+        Err(e) if is_not_supported(&e) => {
+            debug!("Modern detection: KVM_GET_REG_LIST not supported, falling back to legacy");
+            return None;
+        }
+        Err(e) if e.errno() == libc::E2BIG => probe.as_fam_struct_ref().n as usize,
+        Err(e) => {
+            debug!(
+                "Modern detection: Error probing register list size: {:?}, falling back to legacy",
+                e
+            );
+            return None;
+        }
+    };
+
+    let mut reg_list = match RegList::new(needed) {
+        Ok(list) => list,
+        Err(e) => {
+            debug!(
+                "Modern detection: Failed to allocate RegList with {} entries: {:?}, falling back to legacy",
+                needed, e
             );
             return None;
         }
@@ -292,19 +327,30 @@ fn detect_extensions_modern(vcpu: &VcpuFd) -> Option<BTreeSet<String>> {
                 "Modern detection: Got register list with {} registers",
                 reg_list.as_slice().len()
             );
+            Some(reg_list)
         }
         Err(e) => {
-            if is_not_supported(&e) {
-                debug!("Modern detection: KVM_GET_REG_LIST not supported, falling back to legacy");
-            } else {
-                debug!(
-                    "Modern detection: Error getting register list: {:?}, falling back to legacy",
-                    e
-                );
-            }
-            return None;
+            debug!(
+                "Modern detection: Error getting register list after resizing to {}: {:?}, falling back to legacy",
+                needed, e
+            );
+            None
         }
     }
+}
+
+fn detect_extensions_modern(vcpu: &VcpuFd) -> Option<BTreeSet<String>> {
+    debug!("Modern detection: Attempting KVM_GET_REG_LIST");
+
+    // KVM_GET_REG_LIST exposes every register the vCPU has (config, core,
+    // CSR, timer, fp, vector, ISA ext, SBI ext/state, ...), which on real
+    // RVA23S64 hardware comfortably exceeds our previous fixed guess. Mirror
+    // QEMU's two-call protocol (target/riscv/kvm/kvm-cpu.c
+    // kvm_riscv_init_cfg()): probe with a zero-sized list first, let the
+    // kernel report the real count via -E2BIG (arch/riscv/kvm/vcpu.c
+    // KVM_GET_REG_LIST handler always writes the true count back before
+    // checking capacity), then reallocate exactly that size and retry.
+    let reg_list = probe_reg_list(vcpu)?;
 
     let registers = reg_list.as_slice();
     let mut extensions = BTreeSet::new();
