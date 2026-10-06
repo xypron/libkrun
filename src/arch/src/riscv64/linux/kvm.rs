@@ -4,9 +4,78 @@
 use std::collections::BTreeSet;
 use std::result;
 
-use kvm_bindings::RegList;
 use kvm_ioctls::VcpuFd;
 use log::debug;
+use vmm_sys_util::ioctl::ioctl_with_mut_ptr;
+use vmm_sys_util::ioctl_iowr_nr;
+
+/// `KVMIO` ioctl type and `KVM_GET_REG_LIST`'s number, matching
+/// `kvm_bindings::KVMIO` and `kvm_ioctls::KVM_GET_REG_LIST()`
+/// (`arch/riscv/include/uapi/asm/kvm.h` and `include/uapi/linux/kvm.h`:
+/// `#define KVM_GET_REG_LIST _IOWR(KVMIO, 0xb0, struct kvm_reg_list)`).
+/// Declared locally rather than reusing `kvm_ioctls`'s private binding so we
+/// can call the ioctl with our own, uncapped buffer type (see `RawRegList`).
+const KVMIO: u32 = 174;
+ioctl_iowr_nr!(KVM_GET_REG_LIST, KVMIO, 0xb0, u64);
+
+/// Owned, correctly-sized buffer for a `KVM_GET_REG_LIST` call.
+///
+/// Mirrors the kernel's `struct kvm_reg_list` (`include/uapi/linux/kvm.h`):
+/// a `u64` count header (`n`) followed by `n` trailing `u64` register IDs,
+/// laid out as one contiguous block (`[header, entry_0, entry_1, ...]`)
+/// backed by a `Vec<u64>`, which guarantees correct 8-byte alignment for
+/// the whole buffer -- unlike a `Vec<u8>` cast to a `#[repr(C)]` struct,
+/// which would only be guaranteed 1-byte aligned.
+///
+/// `kvm_bindings::RegList` wraps the same on-wire layout but caps the
+/// capacity at a hardcoded `RISCV64_REGS_MAX = 200`, which real RVA23S64
+/// hardware with Vector, AIA and SBI extensions enabled can exceed
+/// (observed: 246). We own the allocation here instead so we are not bound
+/// by that crate-side ceiling.
+struct RawRegList {
+    /// `words[0]` is the `n` header field; `words[1..]` are the register
+    /// IDs, sized to hold exactly `capacity` of them.
+    words: Vec<u64>,
+}
+
+impl RawRegList {
+    /// Allocates a zeroed buffer with its header set to request `capacity`
+    /// entries, able to hold up to `capacity` register IDs.
+    fn new(capacity: usize) -> Self {
+        let mut words = vec![0u64; 1 + capacity];
+        words[0] = capacity as u64;
+        RawRegList { words }
+    }
+
+    /// Calls `KVM_GET_REG_LIST` on `vcpu`, filling in `self` in place.
+    fn get_reg_list(&mut self, vcpu: &VcpuFd) -> result::Result<(), kvm_ioctls::Error> {
+        // SAFETY: `self.words` is a correctly-aligned, contiguous buffer of
+        // at least `1 + capacity` u64s, matching the kernel's expected
+        // `struct kvm_reg_list { u64 n; u64 reg[]; }` layout for the
+        // KVM_GET_REG_LIST ioctl (KVMIO 0xb0, _IOWR). The kernel reads `n`
+        // (our requested capacity) and, on success, writes up to that many
+        // register IDs into the trailing slots; on `-E2BIG` it only
+        // overwrites `n` with the real count and touches nothing else.
+        let ret = unsafe { ioctl_with_mut_ptr(vcpu, KVM_GET_REG_LIST(), self.words.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(kvm_ioctls::Error::last());
+        }
+        Ok(())
+    }
+
+    /// The real register count: our requested capacity on input, or the
+    /// kernel-reported true count after a `KVM_GET_REG_LIST` call.
+    fn n(&self) -> u64 {
+        self.words[0]
+    }
+
+    /// The register IDs following the header, i.e. up to `self.n()`
+    /// entries actually filled in by a successful `KVM_GET_REG_LIST` call.
+    fn entries(&self) -> &[u64] {
+        let len = (self.n() as usize).min(self.words.len() - 1);
+        &self.words[1..1 + len]
+    }
+}
 
 /// Errors encountered during ISA detection and configuration discovery.
 #[derive(Debug)]
@@ -279,19 +348,10 @@ fn build_isa_string(isa_bitmask: u64, extensions: &BTreeSet<String>) -> String {
 /// real register count, which is then used to allocate a correctly-sized
 /// list and retry. Returns `None` if the ioctl is unsupported (`-ENOENT`)
 /// or any other unexpected error occurs.
-fn probe_reg_list(vcpu: &VcpuFd) -> Option<RegList> {
-    let mut probe = match RegList::new(0) {
-        Ok(list) => list,
-        Err(e) => {
-            debug!(
-                "Modern detection: Failed to create probe RegList: {:?}, falling back to legacy",
-                e
-            );
-            return None;
-        }
-    };
+fn probe_reg_list(vcpu: &VcpuFd) -> Option<RawRegList> {
+    let mut probe = RawRegList::new(0);
 
-    let needed = match vcpu.get_reg_list(&mut probe) {
+    let needed = match probe.get_reg_list(vcpu) {
         Ok(()) => {
             // The vCPU genuinely has zero registers; nothing more to do.
             return Some(probe);
@@ -300,7 +360,7 @@ fn probe_reg_list(vcpu: &VcpuFd) -> Option<RegList> {
             debug!("Modern detection: KVM_GET_REG_LIST not supported, falling back to legacy");
             return None;
         }
-        Err(e) if e.errno() == libc::E2BIG => probe.as_fam_struct_ref().n as usize,
+        Err(e) if e.errno() == libc::E2BIG => probe.n() as usize,
         Err(e) => {
             debug!(
                 "Modern detection: Error probing register list size: {:?}, falling back to legacy",
@@ -310,22 +370,13 @@ fn probe_reg_list(vcpu: &VcpuFd) -> Option<RegList> {
         }
     };
 
-    let mut reg_list = match RegList::new(needed) {
-        Ok(list) => list,
-        Err(e) => {
-            debug!(
-                "Modern detection: Failed to allocate RegList with {} entries: {:?}, falling back to legacy",
-                needed, e
-            );
-            return None;
-        }
-    };
+    let mut reg_list = RawRegList::new(needed);
 
-    match vcpu.get_reg_list(&mut reg_list) {
+    match reg_list.get_reg_list(vcpu) {
         Ok(()) => {
             debug!(
                 "Modern detection: Got register list with {} registers",
-                reg_list.as_slice().len()
+                reg_list.entries().len()
             );
             Some(reg_list)
         }
@@ -344,15 +395,16 @@ fn detect_extensions_modern(vcpu: &VcpuFd) -> Option<BTreeSet<String>> {
 
     // KVM_GET_REG_LIST exposes every register the vCPU has (config, core,
     // CSR, timer, fp, vector, ISA ext, SBI ext/state, ...), which on real
-    // RVA23S64 hardware comfortably exceeds our previous fixed guess. Mirror
-    // QEMU's two-call protocol (target/riscv/kvm/kvm-cpu.c
-    // kvm_riscv_init_cfg()): probe with a zero-sized list first, let the
-    // kernel report the real count via -E2BIG (arch/riscv/kvm/vcpu.c
-    // KVM_GET_REG_LIST handler always writes the true count back before
-    // checking capacity), then reallocate exactly that size and retry.
+    // RVA23S64 hardware comfortably exceeds kvm-bindings's RegList cap of
+    // 200 entries (observed: 246). Mirror QEMU's two-call protocol
+    // (target/riscv/kvm/kvm-cpu.c kvm_riscv_init_cfg()) using our own
+    // RawRegList: probe with a zero-sized list first, let the kernel report
+    // the real count via -E2BIG (arch/riscv/kvm/vcpu.c KVM_GET_REG_LIST
+    // handler always writes the true count back before checking capacity),
+    // then reallocate exactly that size and retry.
     let reg_list = probe_reg_list(vcpu)?;
 
-    let registers = reg_list.as_slice();
+    let registers = reg_list.entries();
     let mut extensions = BTreeSet::new();
 
     for (name, kvm_ext_id) in KVM_ISA_EXT_TABLE {
