@@ -132,11 +132,12 @@ fn create_cpu_nodes(
         // Add ISA extensions if available
         if let Some(isa_info) = riscv_isa_info {
             if !isa_info.extensions.is_empty() {
-                let ext_array: Vec<&str> = isa_info.extensions.iter().map(|s| s.as_str()).collect();
-                // For now, serialize as a single string with commas
-                // TODO: Use property_string_array when available in vm-fdt
-                let ext_str = ext_array.join(",");
-                fdt.property_string("riscv,isa-extensions", &ext_str)?;
+                // "riscv,isa-extensions" is a devicetree stringlist: each
+                // extension name must be its own NUL-terminated string, not
+                // a single comma-joined string. property_string_list()
+                // concatenates each entry with its own trailing NUL.
+                let ext_list: Vec<String> = isa_info.extensions.iter().cloned().collect();
+                fdt.property_string_list("riscv,isa-extensions", ext_list)?;
             }
 
             // Add cache block sizes if available
