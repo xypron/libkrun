@@ -667,6 +667,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "linux-loader",
+ "log",
  "tdx",
  "vm-memory",
  "vmm-sys-util",

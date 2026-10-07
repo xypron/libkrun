@@ -14,6 +14,7 @@ tdx = [ "tee", "dep:tdx" ]
 
 [dependencies]
 libc = ">=0.2.39"
+log = "0.4.0"
 vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 
