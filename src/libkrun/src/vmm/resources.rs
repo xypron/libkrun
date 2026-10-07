@@ -235,6 +235,9 @@ pub struct VmResources {
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
+    /// RISC-V ISA information discovered from KVM
+    #[cfg(target_arch = "riscv64")]
+    pub riscv_isa_info: Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
     /// Enable the embedded dhcp client in init.c
     #[cfg(feature = "net")]
     pub dhcp_client: bool,
