@@ -2189,7 +2189,7 @@ pub unsafe extern "C" fn krun_set_kernel(
             // process and treat it as a bundled kernel.
             #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
             0 => return map_kernel(ctx_id, &path),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             0 => KernelFormat::Raw,
             1 => KernelFormat::Elf,
             2 => KernelFormat::PeGz,
