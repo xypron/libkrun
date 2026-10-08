@@ -207,10 +207,14 @@ pub enum StartMicrovmError {
     OpenConsoleFile(io::Error),
     /// The GZIP decoder couldn't decompress the kernel.
     PeGzDecoder(io::Error),
+    /// Cannot load the decompressed kernel into guest memory.
+    PeGzLoadKernel(vm_memory::GuestMemoryError),
     /// Cannot open the file containing the kernel code.
     PeGzOpenKernel(io::Error),
     /// Cannot find compressed kernel in file.
     PeGzInvalid,
+    /// Cannot load the kernel into guest memory.
+    RawLoadKernel(vm_memory::GuestMemoryError),
     /// Cannot open the file containing the kernel code.
     RawOpenKernel(io::Error),
     /// Cannot initialize a MMIO Balloon device or add a device to the MMIO Bus.
@@ -398,11 +402,17 @@ impl Display for StartMicrovmError {
             PeGzDecoder(ref err) => {
                 write!(f, "The GZIP decoder couldn't decompress the kernel. {err}")
             }
+            PeGzLoadKernel(ref err) => {
+                write!(f, "Cannot load the decompressed kernel into guest memory. {err}")
+            }
             PeGzOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code. {err}")
             }
             PeGzInvalid => {
                 write!(f, "Cannot find compressed kernel in file.")
+            }
+            RawLoadKernel(ref err) => {
+                write!(f, "Cannot load the kernel into guest memory. {err}")
             }
             RawOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
@@ -1422,6 +1432,25 @@ pub fn build_microvm(
     Ok(vmm)
 }
 
+/// Returns the guest-physical address at which a raw (uncompressed or gzip-compressed) flat
+/// kernel "Image" must be loaded for aarch64/riscv64, i.e. the start of guest RAM. This mirrors
+/// what a bootloader (or UEFI, for EFI-stub boot) does: the "Image" format's own boot header
+/// (see Documentation/arm64/booting.rst / Documentation/riscv/boot-image-header.rst) places the
+/// kernel's early boot code relative to the start of physical RAM, not at an architecture- or
+/// platform-independent fixed address. Each architecture's RAM base is therefore used here,
+/// rather than a single hardcoded constant shared across architectures.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn external_kernel_raw_load_addr() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        arch::aarch64::layout::DRAM_MEM_START_KERNEL
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::layout::DRAM_MEM_START
+    }
+}
+
 fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
@@ -1440,8 +1469,11 @@ fn load_external_kernel(
         KernelFormat::Raw => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::RawOpenKernel)?;
-            guest_mem.write(&data, GuestAddress(0x8000_0000)).unwrap();
-            GuestAddress(0x8000_0000)
+            let load_addr = GuestAddress(external_kernel_raw_load_addr());
+            guest_mem
+                .write(&data, load_addr)
+                .map_err(StartMicrovmError::RawLoadKernel)?;
+            load_addr
         }
         #[cfg(target_arch = "x86_64")]
         KernelFormat::Elf => {
@@ -1474,10 +1506,11 @@ fn load_external_kernel(
                 let mut kernel_data: Vec<u8> = Vec::new();
                 gz.read_to_end(&mut kernel_data)
                     .map_err(StartMicrovmError::PeGzDecoder)?;
+                let load_addr = GuestAddress(external_kernel_raw_load_addr());
                 guest_mem
-                    .write(&kernel_data, GuestAddress(0x8000_0000))
-                    .unwrap();
-                GuestAddress(0x8000_0000)
+                    .write(&kernel_data, load_addr)
+                    .map_err(StartMicrovmError::PeGzLoadKernel)?;
+                load_addr
             } else {
                 return Err(StartMicrovmError::PeGzInvalid);
             }
