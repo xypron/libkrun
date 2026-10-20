@@ -20,7 +20,12 @@ virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
 timesync = []
-vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
+# Gates only the opt-in, user-facing VhostUserDevice FFI builder (used
+# for external GPU/media/etc backends). The internal vhost-device-rtc
+# backend plumbing does not depend on this feature: on Linux the vhost
+# crate and vhost-user-backend are unconditional dependencies, since
+# virtio-rtc is the always-on default RTC there (see rtc module).
+vhost-user = ["krun_display"]
 ffi = ["dep:ffier"]
 
 [dependencies]
@@ -32,8 +37,6 @@ libloading = "0.8"
 log = "0.4.0"
 rand = "0.10.2"
 thiserror = { version = "2.0", optional = true }
-vhost = { version = "0.17", optional = true, features = ["vhost-user-frontend"] }
-vmm-sys-util = { version = "0.15", optional = true }
 virtio-bindings = "0.2.0"
 zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
@@ -59,6 +62,13 @@ caps = "0.5.5"
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"
 vmm-sys-util = "0.15"
+# Unconditional on Linux: virtio-rtc is the always-on default RTC there,
+# backed in-process by vhost-device-rtc over a minimal vhost-user
+# frontend (vhost-user-frontend feature).
+vhost = { version = "0.17", features = ["vhost-user-frontend"] }
+# vhost-device-rtc has no release of its own: this is the commit tagged
+# vhost-device-media-v0.1.1 (the repo-wide tag at that point).
+vhost-device-rtc = { git = "https://github.com/rust-vmm/vhost-device.git", rev = "bdf2a50d87e3f1f3f9b95c50b38fdfa207be8093" }
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"
