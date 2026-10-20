@@ -84,7 +84,11 @@ use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+// File-backed (memfd) guest memory is needed unconditionally on
+// Linux/KVM, not just when the opt-in `vhost-user` feature is on:
+// virtio-rtc (always attached there, see build_microvm) is itself a
+// vhost-user device and requires it.
+#[cfg(target_os = "linux")]
 use vm_memory::FileOffset;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
@@ -217,6 +221,8 @@ pub enum StartMicrovmError {
     RegisterNetDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Rng device or add a device to the MMIO Bus.
     RegisterRngDevice(device_manager::mmio::Error),
+    /// Cannot initialize the default MMIO RTC device or add it to the MMIO Bus.
+    RegisterRtcDevice(device_manager::mmio::Error),
     /// Cannot initialize a vhost-user device or add a device to the MMIO Bus.
     RegisterVhostUserDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
@@ -492,6 +498,14 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO Rng Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            RegisterRtcDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot initialize the default MMIO RTC device or add it to the MMIO Bus. {err_msg}"
                 )
             }
             RegisterVhostUserDevice(ref err) => {
@@ -807,6 +821,13 @@ pub fn build_microvm(
     let gpu_shm_size = requirements.iter().filter_map(|r| r.gpu_shm).next();
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
+    // virtio-rtc is attached unconditionally on every Linux/KVM guest
+    // (see below) and is itself a vhost-user device, so guest memory
+    // must always be file (memfd) backed there, regardless of whether
+    // any other device also requires shareable memory.
+    #[cfg(target_os = "linux")]
+    let use_vhost_user = true;
+    #[cfg(not(target_os = "linux"))]
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
 
     #[cfg(feature = "tdx")]
@@ -1387,6 +1408,29 @@ pub fn build_microvm(
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty.as_handle()), false);
     }
 
+    // virtio-rtc is the default RTC device on Linux/KVM (x86_64,
+    // aarch64, riscv64, including under tee): an in-process
+    // vhost-device-rtc backend connected through a minimal vhost-user
+    // frontend (see devices::virtio::rtc), replacing the legacy PL031
+    // that used to be attached unconditionally on aarch64. HVF/macOS
+    // (no vhost-user transport) and WHP/Windows keep their existing
+    // RTC devices untouched. Unlike user-facing devices (Rng, Balloon,
+    // ...), it is not exposed through the device builder API: callers
+    // get it for free.
+    #[cfg(target_os = "linux")]
+    {
+        let rtc = Arc::new(Mutex::new(
+            devices::virtio::rtc::spawn_backend()
+                .map_err(|e| Error::EventFd(io::Error::other(format!("rtc: {e}"))))
+                .map_err(StartMicrovmError::Internal)?,
+        ));
+        event_manager
+            .add_subscriber(rtc.clone())
+            .map_err(StartMicrovmError::RegisterEvent)?;
+        attach_mmio_device(&mut vmm, "rtc".to_string(), intc.clone(), rtc)
+            .map_err(StartMicrovmError::RegisterRtcDevice)?;
+    }
+
     device_manager
         .attach_all(
             &mut vmm,
@@ -1747,7 +1791,7 @@ pub fn load_payload(
             let use_vhost_user = _use_vhost_user;
 
             let kernel_region = if use_vhost_user {
-                #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+                #[cfg(target_os = "linux")]
                 {
                     debug!(
                         "Creating file-backed kernel region for vhost-user (size=0x{:x})",
@@ -1805,7 +1849,7 @@ pub fn load_payload(
 
                     region
                 }
-                #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
+                #[cfg(not(target_os = "linux"))]
                 unreachable!()
             } else {
                 // SAFETY: kernel_host_addr points to valid kernel data of size kernel_size.
@@ -2031,7 +2075,7 @@ pub fn create_guest_memory(
     arch_mem_regions.extend(shm_manager.regions());
 
     let guest_mem = if use_vhost_user {
-        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         {
             debug!(
                 "Creating file-backed memory for vhost-user (regions: {})",
@@ -2080,7 +2124,7 @@ pub fn create_guest_memory(
             GuestMemoryMmap::from_ranges_with_files(&regions_with_files)
                 .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
         }
-        #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         unreachable!()
     } else {
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
@@ -2344,11 +2388,13 @@ fn attach_legacy_devices(
             .map_err(StartMicrovmError::Internal)?;
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    mmio_device_manager
-        .register_mmio_rtc(vm.fd())
-        .map_err(Error::RegisterMMIODevice)
-        .map_err(StartMicrovmError::Internal)?;
+    // The legacy PL031 RTC (`register_mmio_rtc`) is no longer attached
+    // here: on Linux/KVM, virtio-rtc (backed in-process by
+    // vhost-device-rtc, attached unconditionally in `build_microvm`) is
+    // now the default RTC on every architecture. The PL031 device code
+    // itself is kept in the tree for aarch64/macOS (HVF has no
+    // vhost-user transport) and for potential future reuse (e.g.
+    // aarch64 Windows guests).
 
     Ok(())
 }

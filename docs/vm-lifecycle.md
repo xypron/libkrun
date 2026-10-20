@@ -47,6 +47,10 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
 - **Acceleration & GUI**: `GpuDevice` (Venus / native context) and `InputDevice` (mouse/keyboard).
 - **vhost-user**: `VhostUserDevice` for external virtio backends (RNG, RTC, GPU, Sound, CAN, Media).
 - **Utilities**: `RngDevice` (virtio-rng) and `BalloonDevice` (virtio-balloon page reporting).
+- **Implicit devices**: on Linux/KVM, a virtio-rtc device (UTC, TAI and
+  monotonic clocks, cross-timestamping and alarms) is always attached. It is
+  served by an in-process `vhost-device-rtc` backend, is not configurable
+  through the device API, and makes guest memory memfd-backed.
 
 ## 4. VMM Builder
 

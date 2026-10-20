@@ -236,7 +236,13 @@ impl MMIODeviceManager {
     }
 
     #[cfg(target_arch = "aarch64")]
-    /// Register a MMIO RTC device.
+    /// Register a MMIO RTC device (legacy PL031).
+    ///
+    /// Currently unused: on Linux/KVM, virtio-rtc (backed in-process by
+    /// vhost-device-rtc) is the default RTC on every architecture.
+    /// Kept for potential future reuse (e.g. aarch64 Windows guests,
+    /// which may need a PL031-compatible RTC).
+    #[allow(dead_code)]
     pub fn register_mmio_rtc(&mut self, vm: &VmFd) -> Result<()> {
         let irq = self.irqs.alloc()?;
 
